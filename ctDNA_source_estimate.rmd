@@ -1,0 +1,111 @@
+---
+title: "Estimating the source of ctDNA from VAF infomation using Bayesian hierarchical modeling"
+---
+
+### load required packages
+```{r load packages, include=FALSE}
+library(rjags)
+library(tidyverse)
+```
+
+### load and process data
+```{r load data, echo=FALSE, include=FALSE}
+project_data <- read.csv("./Mock_data_for_bayesian_modeling.csv")
+
+patient_list <- project_data$patient %>% unique()
+patient_table <- table(project_data$patient) %>% 
+  data.frame() %>%
+  filter(Freq >= 5 & Freq < 50)
+
+project_data_df <- project_data %>%
+  mutate(ID = patient) %>%
+  select(ID, AFp, AFm, AFct) %>%
+  filter(ID %in% patient_table$Var1) %>%
+  mutate(ID = as.numeric(factor(ID))) %>%
+  mutate(AFct = abs(AFct))
+
+pairs(project_data_df)
+print(paste0("The shape of input data: ",dim(project_data_df)[[1]], " - ", dim(project_data_df)[[2]]))
+print(paste0("The number of samples: ", length(unique(project_data_df$ID))))
+
+num_ID = length(unique(project_data_df$ID))
+```
+
+### specificy hierarchical model
+## a is the ctDNA contribution from primary tumor, b is the ctDNA contribution from metastasis 
+```{r specifiy model, echo=FALSE, include=FALSE}
+mod_string = " model {
+  for (i in 1:length(AFct)) {
+    AFct[i] ~ dnorm(mu[i], prec)
+    mu[i] = r + a[ID[i]]*AFp[i] + b[ID[i]]*AFm[i] 
+  }
+  
+  for (j in 1:10) {
+    a[j] ~ dexp(lambdaa)
+    b[j] ~ dexp(lambdab)
+  }
+  
+  r ~ dnorm(0, 1e5)
+  prec ~ dgamma(1,1)
+
+  lambdaa ~ dgamma(2,0.5*1e-3)
+  lambdab ~ dgamma(2,0.5*1e-3)
+  
+} "
+```
+
+```{r run simulation, echo=FALSE, include=FALSE}
+set.seed(99)
+data_jags = list(AFct=project_data_df$AFct, AFp=project_data_df$AFp,
+                 AFm=project_data_df$AFm, ID=project_data_df$ID)
+
+params = c("r","prec", "a", "b", "lambdaa", "lambdab")
+mod = jags.model(textConnection(mod_string), data=data_jags, n.chains=3)
+update(mod, 5e3)
+
+mod_sim = coda.samples(model = mod, variable.names = params, n.iter = 5e3)
+mod_csim = as.mcmc(do.call(rbind, mod_sim))
+```
+
+### check the quality of the simulation results
+```{r check results, echo=FALSE, include=FALSE}
+gelman.diag(mod_sim)
+autocorr.diag(mod_sim)
+summary(mod_sim)
+
+effectiveSize(mod_csim)
+dic.samples(mod,n.iter = 1e4)
+
+parameter_estimate <- colMeans(mod_csim)
+para_df <- data.frame(ID = 1:num_ID, para_a = parameter_estimate[1:num_ID], para_b = parameter_estimate[(num_ID+1):(num_ID*2)])
+
+project_data_df_pred <- project_data_df %>%
+  left_join(para_df, by = c("ID")) %>%
+  mutate(pred = AFp * para_a + AFm * para_b) %>%
+  mutate(resid = AFct - pred)
+
+plot(project_data_df_pred$resid)
+qqnorm(project_data_df_pred$resid[-c(1:10)])
+
+simple_lm <- lm(AFct ~ AFp + AFm, data = project_data_df)
+plot(resid(simple_lm), ylab = "resid")
+plot(predict(simple_lm), resid(simple_lm), xlab = "pred", ylab = "resid")
+qqnorm(resid(simple_lm))
+```
+
+### analyze results
+### for example, analyzing the probability that metastasis contributes more ctDNA than primary tumor
+```{r analyze results, echo=FALSE, include=FALSE}
+Pab_df <- matrix(nrow = nrow(mod_csim), ncol = num_ID) %>% data.frame()
+for(i in 1:num_ID){
+  Pab_df[,i] <- mod_csim[,num_ID+i] - mod_csim[,i]
+}
+Pab_df_Prob <- lapply(Pab_df, function(x){
+  sum(x>0)
+}) %>% unlist()
+
+Pab_final <- rbind(Pab_df_Prob/15000) %>% data.frame()
+colnames(Pab_final) <- paste0("ID",c(1:num_ID))
+rownames(Pab_final) <- c("P(b>a)")
+Pab_final
+```
